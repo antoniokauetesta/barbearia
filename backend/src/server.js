@@ -1,9 +1,29 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
+import cookieParser from "cookie-parser";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import { prisma } from "./lib/prisma.ts";
+
+if (!process.env.JWT_SECRET) {
+  console.error("Defina JWT_SECRET no arquivo .env antes de iniciar a API.");
+  process.exit(1);
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const SESSAO_MS = 8 * 60 * 60 * 1000;
+
 const app = express();
 
+app.use(
+  cors({
+    origin: process.env.FRONTEND_URL || "http://localhost:5173",
+    credentials: true,
+  })
+);
 app.use(express.json());
+app.use(cookieParser());
 
 const asyncRoute = (handler) => (req, res, next) =>
   Promise.resolve(handler(req, res, next)).catch(next);
@@ -11,24 +31,135 @@ const asyncRoute = (handler) => (req, res, next) =>
 const idValido = (id) =>
   Number.isInteger(Number(id)) && Number(id) > 0;
 
-const statusPermitidos = [
-  "PENDENTE",
-  "CONFIRMADO",
-  "CONCLUIDO",
-  "CANCELADO",
-];
-
 const relacionamentos = {
   include: {
     cliente: true,
     barbeiro: true,
     servico: true,
+    status: true,
   },
 };
+
+const opcoesCookie = {
+  httpOnly: true,
+  sameSite: "lax",
+  secure: process.env.NODE_ENV === "production",
+  maxAge: SESSAO_MS,
+};
+
+const usuarioPublico = ({ id, nome, email }) => ({ id, nome, email });
+
+const emailValido = (email) =>
+  typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+
+function iniciarSessao(res, usuario) {
+  const token = jwt.sign({ sub: usuario.id }, JWT_SECRET, {
+    expiresIn: Math.floor(SESSAO_MS / 1000),
+  });
+  res.cookie("token", token, opcoesCookie);
+}
+
+const HASH_FALSO = bcrypt.hashSync("senha-falsa-para-timing", 12);
+
+async function autenticar(req, res, next) {
+  const token = req.cookies?.token;
+
+  if (!token) {
+    return res.status(401).json({ erro: "Não autenticado" });
+  }
+
+  try {
+    const { sub } = jwt.verify(token, JWT_SECRET);
+    const usuario = await prisma.usuario.findUnique({ where: { id: sub } });
+
+    if (!usuario) {
+      res.clearCookie("token", { ...opcoesCookie, maxAge: undefined });
+      return res.status(401).json({ erro: "Sessão inválida" });
+    }
+
+    req.usuario = usuario;
+    next();
+  } catch (error) {
+    if (error.name === "JsonWebTokenError" || error.name === "TokenExpiredError") {
+      res.clearCookie("token", { ...opcoesCookie, maxAge: undefined });
+      return res.status(401).json({ erro: "Sessão expirada. Entre novamente." });
+    }
+    next(error);
+  }
+}
 
 app.get("/", (req, res) => {
   res.json({ mensagem: "API da Barbearia funcionando!" });
 });
+
+
+app.post("/auth/registro", asyncRoute(async (req, res) => {
+  const { nome, email, senha } = req.body;
+
+  if (typeof nome !== "string" || !nome.trim() || !emailValido(email)) {
+    return res.status(400).json({ erro: "Informe nome e e-mail válidos" });
+  }
+
+  if (typeof senha !== "string" || senha.length < 6) {
+    return res.status(400).json({
+      erro: "A senha deve ter pelo menos 6 caracteres",
+    });
+  }
+
+
+  const senhaHash = await bcrypt.hash(senha, 12);
+
+  const usuario = await prisma.usuario.create({
+    data: {
+      nome: nome.trim(),
+      email: email.trim().toLowerCase(),
+      senhaHash,
+    },
+  });
+
+  iniciarSessao(res, usuario);
+  res.status(201).json(usuarioPublico(usuario));
+}));
+
+app.post("/auth/login", asyncRoute(async (req, res) => {
+  const { email, senha } = req.body;
+
+  if (typeof email !== "string" || typeof senha !== "string") {
+    return res.status(400).json({ erro: "Informe e-mail e senha" });
+  }
+
+  const usuario = await prisma.usuario.findUnique({
+    where: { email: email.trim().toLowerCase() },
+  });
+
+  const senhaCorreta = await bcrypt.compare(
+    senha,
+    usuario ? usuario.senhaHash : HASH_FALSO
+  );
+
+  if (!usuario || !senhaCorreta) {
+    return res.status(401).json({ erro: "E-mail ou senha incorretos" });
+  }
+
+  iniciarSessao(res, usuario);
+  res.json(usuarioPublico(usuario));
+}));
+
+app.post("/auth/logout", (req, res) => {
+  res.clearCookie("token", { ...opcoesCookie, maxAge: undefined });
+  res.json({ mensagem: "Sessão encerrada" });
+});
+
+app.use(autenticar);
+
+app.get("/auth/me", (req, res) => {
+  res.json(usuarioPublico(req.usuario));
+});
+
+app.get("/status", asyncRoute(async (req, res) => {
+  const status = await prisma.status.findMany({ orderBy: { id: "asc" } });
+  res.json(status);
+}));
 
 app.get("/clientes", asyncRoute(async (req, res) => {
   const clientes = await prisma.cliente.findMany({
@@ -354,9 +485,20 @@ app.post("/agendamentos", asyncRoute(async (req, res) => {
     });
   }
 
+  const statusInicial = await prisma.status.findUnique({
+    where: { nome: "PENDENTE" },
+  });
+
+  if (!statusInicial) {
+    return res.status(500).json({
+      erro: "Status PENDENTE não cadastrado na tabela de status",
+    });
+  }
+
   const agendamento = await prisma.agendamento.create({
     data: {
       dataHora: data,
+      statusId: statusInicial.id,
       clienteId: Number(clienteId),
       barbeiroId: Number(barbeiroId),
       servicoId: Number(servicoId),
@@ -379,7 +521,7 @@ app.put("/agendamentos/:id", asyncRoute(async (req, res) => {
     barbeiroId,
     servicoId,
     observacao,
-    status,
+    statusId,
   } = req.body;
 
   const data = {};
@@ -409,11 +551,20 @@ app.put("/agendamentos/:id", asyncRoute(async (req, res) => {
 
   if (observacao !== undefined) data.observacao = observacao;
 
-  if (status !== undefined) {
-    if (!statusPermitidos.includes(status)) {
+  if (statusId !== undefined) {
+    if (!idValido(statusId)) {
       return res.status(400).json({ erro: "Status inválido" });
     }
-    data.status = status;
+
+    const status = await prisma.status.findUnique({
+      where: { id: Number(statusId) },
+    });
+
+    if (!status) {
+      return res.status(400).json({ erro: "Status inválido" });
+    }
+
+    data.statusId = status.id;
   }
 
   const agendamento = await prisma.agendamento.update({
@@ -446,7 +597,7 @@ app.use((error, req, res, next) => {
 
   if (error.code === "P2002") {
     return res.status(409).json({
-      erro: "Telefone ou email já cadastrado",
+      erro: "Telefone ou e-mail já cadastrado",
     });
   }
 

@@ -47,19 +47,39 @@ model Servico {
 model Agendamento {
   id         Int      @id @default(autoincrement())
   dataHora   DateTime
-  status     String   @default("PENDENTE")
   observacao String?
   criadoEm   DateTime @default(now())
   clienteId  Int
   barbeiroId Int
   servicoId  Int
+  statusId   Int
 
   cliente  Cliente  @relation(fields: [clienteId], references: [id])
   barbeiro Barbeiro @relation(fields: [barbeiroId], references: [id])
   servico  Servico  @relation(fields: [servicoId], references: [id])
+  status   Status   @relation(fields: [statusId], references: [id])
 
   @@index([dataHora])
   @@index([clienteId])
   @@index([barbeiroId])
+  @@index([statusId])
   @@map("agendamentos")
+}
+
+model Status {
+  id           Int           @id @default(autoincrement())
+  nome         String        @unique
+  agendamentos Agendamento[]
+
+  @@map("status")
+}
+
+model Usuario {
+  id        Int      @id @default(autoincrement())
+  nome      String
+  email     String   @unique
+  senhaHash String
+  criadoEm  DateTime @default(now())
+
+  @@map("usuarios")
 }
